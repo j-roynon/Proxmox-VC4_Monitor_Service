@@ -1,0 +1,26 @@
+[Unit]
+Description=Proxmox VC4 Monitor - HA Cluster Health & Failover
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/proxmox-monitor
+ExecStart=/opt/proxmox-monitor/venv/bin/python /opt/proxmox-monitor/Proxmox_Manager.py --config /etc/proxmox-monitor/config.yaml
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables for sensitive credentials
+EnvironmentFile=/etc/proxmox-monitor/proxmox-monitor.env
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/proxmox-monitor /var/log/proxmox-monitor
+
+[Install]
+WantedBy=multi-user.target
