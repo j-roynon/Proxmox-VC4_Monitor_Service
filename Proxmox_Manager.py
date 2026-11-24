@@ -116,10 +116,10 @@ class ProxmoxManager:
     
     def get_vm_status(self, vm_id: str) -> VMStatus:
         """
-        Get the current status of a VM/container.
+        Get the current status of a VM/container (supports both LXC and QEMU).
         
         Args:
-            vm_id: Container ID in Proxmox
+            vm_id: Container/VM ID in Proxmox
             
         Returns:
             VMStatus enum value
@@ -129,21 +129,41 @@ class ProxmoxManager:
                 logger.error("Proxmox not connected")
                 return VMStatus.UNKNOWN
             
-            # Try to get container status from all nodes in cluster
+            # Try to get container/VM status from all nodes in cluster
             for node in self.proxmox.nodes.get():
                 node_name = node['node']
+                
+                # Try LXC container first
                 try:
                     status_response = self.proxmox.nodes(node_name).lxc(vm_id).status.current.get()
                     status_str = status_response.get('status', 'unknown').lower()
                     
                     if status_str == 'running':
-                        logger.debug(f"VM {vm_id} on node {node_name}: RUNNING")
+                        logger.debug(f"VM {vm_id} on node {node_name}: RUNNING (LXC)")
                         return VMStatus.RUNNING
                     elif status_str == 'stopped':
-                        logger.debug(f"VM {vm_id} on node {node_name}: STOPPED")
+                        logger.debug(f"VM {vm_id} on node {node_name}: STOPPED (LXC)")
                         return VMStatus.STOPPED
                     elif status_str == 'paused':
-                        logger.debug(f"VM {vm_id} on node {node_name}: PAUSED")
+                        logger.debug(f"VM {vm_id} on node {node_name}: PAUSED (LXC)")
+                        return VMStatus.PAUSED
+                except Exception:
+                    # Not an LXC container on this node, try QEMU VM
+                    pass
+                
+                # Try QEMU VM
+                try:
+                    status_response = self.proxmox.nodes(node_name).qemu(vm_id).status.current.get()
+                    status_str = status_response.get('status', 'unknown').lower()
+                    
+                    if status_str == 'running':
+                        logger.debug(f"VM {vm_id} on node {node_name}: RUNNING (QEMU)")
+                        return VMStatus.RUNNING
+                    elif status_str == 'stopped':
+                        logger.debug(f"VM {vm_id} on node {node_name}: STOPPED (QEMU)")
+                        return VMStatus.STOPPED
+                    elif status_str == 'paused':
+                        logger.debug(f"VM {vm_id} on node {node_name}: PAUSED (QEMU)")
                         return VMStatus.PAUSED
                 except Exception:
                     # VM not on this node, try next
@@ -158,10 +178,10 @@ class ProxmoxManager:
     
     def migrate_vm(self, vm_id: str, target_node: Optional[str] = None) -> bool:
         """
-        Migrate a VM to another node in the HA cluster.
+        Migrate a VM to another node in the HA cluster (supports both LXC and QEMU).
         
         Args:
-            vm_id: Container ID to migrate
+            vm_id: Container/VM ID to migrate
             target_node: Target node name (if None, Proxmox chooses)
             
         Returns:
@@ -172,22 +192,36 @@ class ProxmoxManager:
                 logger.error("Proxmox not connected")
                 return False
             
-            # Find which node has the VM
+            # Find which node has the VM and determine its type (LXC or QEMU)
             source_node = None
+            vm_type = None  # 'lxc' or 'qemu'
+            
             for node in self.proxmox.nodes.get():
                 node_name = node['node']
+                
+                # Try LXC first
                 try:
                     self.proxmox.nodes(node_name).lxc(vm_id).status.current.get()
                     source_node = node_name
+                    vm_type = 'lxc'
                     break
                 except Exception:
-                    continue
+                    pass
+                
+                # Try QEMU
+                try:
+                    self.proxmox.nodes(node_name).qemu(vm_id).status.current.get()
+                    source_node = node_name
+                    vm_type = 'qemu'
+                    break
+                except Exception:
+                    pass
             
             if not source_node:
                 logger.error(f"Could not find VM {vm_id} on any node")
                 return False
             
-            logger.info(f"Initiating migration of VM {vm_id} from {source_node}")
+            logger.info(f"Initiating migration of VM {vm_id} ({vm_type.upper()}) from {source_node}")
             
             # Prepare migration parameters
             migrate_params = {
@@ -198,8 +232,12 @@ class ProxmoxManager:
             # Remove None values
             migrate_params = {k: v for k, v in migrate_params.items() if v is not None}
             
-            # Trigger migration
-            task_id = self.proxmox.nodes(source_node).lxc(vm_id).migrate.post(**migrate_params)
+            # Trigger migration based on VM type
+            if vm_type == 'lxc':
+                task_id = self.proxmox.nodes(source_node).lxc(vm_id).migrate.post(**migrate_params)
+            else:  # qemu
+                task_id = self.proxmox.nodes(source_node).qemu(vm_id).migrate.post(**migrate_params)
+            
             logger.info(f"Migration started for VM {vm_id}, task ID: {task_id}")
             
             # Wait for migration to complete

@@ -156,7 +156,7 @@ monitor:
       cip_ip_id: 0x13
 ```
 
-**Multiple VMs (same Crestron device):**
+**Multiple VMs (same server):**
 ```yaml
 monitor:
   vms:
@@ -168,7 +168,7 @@ monitor:
       cip_ip_id: 0x13
 ```
 
-**Multiple VMs (different Crestron devices):**
+**Multiple VMs (different servers):**
 ```yaml
 monitor:
   vms:
