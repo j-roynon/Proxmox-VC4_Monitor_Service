@@ -182,7 +182,7 @@ class ProxmoxManager:
         
         Args:
             vm_id: Container/VM ID to migrate
-            target_node: Target node name (if None, Proxmox chooses)
+            target_node: Target node name (if None, picks another available node)
             
         Returns:
             True if migration started successfully
@@ -221,21 +221,32 @@ class ProxmoxManager:
                 logger.error(f"Could not find VM {vm_id} on any node")
                 return False
             
-            logger.info(f"Initiating migration of VM {vm_id} ({vm_type.upper()}) from {source_node}")
+            # If no target node specified, pick the first available node that isn't the source
+            if not target_node:
+                for node in self.proxmox.nodes.get():
+                    if node['node'] != source_node:
+                        target_node = node['node']
+                        break
             
-            # Prepare migration parameters
-            migrate_params = {
-                'target': target_node,
-                'online': True
-            }
+            if not target_node:
+                logger.error(f"No available target nodes for migration (only have {source_node})")
+                return False
             
-            # Remove None values
-            migrate_params = {k: v for k, v in migrate_params.items() if v is not None}
+            logger.info(f"Initiating migration of VM {vm_id} ({vm_type.upper()}) from {source_node} to {target_node}")
             
-            # Trigger migration based on VM type
+            # Prepare migration parameters (differ between LXC and QEMU)
             if vm_type == 'lxc':
+                migrate_params = {
+                    'target': target_node,
+                    'online': 1  # LXC expects 0 or 1
+                }
                 task_id = self.proxmox.nodes(source_node).lxc(vm_id).migrate.post(**migrate_params)
             else:  # qemu
+                # QEMU migration requires target and uses different parameter format
+                migrate_params = {
+                    'target': target_node,
+                    'online': 1  # QEMU also expects 0 or 1
+                }
                 task_id = self.proxmox.nodes(source_node).qemu(vm_id).migrate.post(**migrate_params)
             
             logger.info(f"Migration started for VM {vm_id}, task ID: {task_id}")
