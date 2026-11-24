@@ -76,32 +76,59 @@ sudo journalctl -u proxmox-monitor -f  # Watch logs
 # 1. Navigate to project directory
 cd /path/to/proxmox-monitor
 
-# 2. Run installer (creates directories, venv, service)
+# 2. Run installer (creates directories, venv, service, config)
 sudo bash install.sh
 
 # 3. This creates:
-#    - /opt/proxmox-monitor/           (application + venv)
-#    - /etc/proxmox-monitor/config.yaml (configuration)
-#    - /var/log/proxmox-monitor/       (logs)
-#    - /etc/systemd/system/proxmox-monitor.service (service)
+#    - /opt/proxmox-monitor/                      (application + venv)
+#    - /etc/proxmox-monitor/config.yaml           (VM and monitoring configuration)
+#    - /etc/proxmox-monitor/proxmox-monitor.env   (credentials)
+#    - /var/log/proxmox-monitor/                  (logs)
+#    - /etc/systemd/system/proxmox-monitor.service (systemd service)
 ```
 
-### Post-Install
+### Post-Install Setup
 
 ```bash
-# 1. Configure your setup
-sudo bash reconfigure.sh
+# 1. Set Proxmox password in environment file
+sudo nano /etc/proxmox-monitor/proxmox-monitor.env
+# Edit PROXMOX_PASSWORD=your_password_here with your actual password
+# Save and exit (Ctrl+X, Y, Enter)
 
-# 2. Start service
+# 2. Configure your VMs and Crestron devices
+sudo nano /etc/proxmox-monitor/config.yaml
+# See Configuration section below for details
+# Save and exit
+
+# 3. Start the service
 sudo systemctl start proxmox-monitor
-sudo systemctl enable proxmox-monitor
+sudo systemctl enable proxmox-monitor  # Auto-start on boot
 
-# 3. Verify it's running
+# 4. Verify it's running
 sudo systemctl status proxmox-monitor
-sudo journalctl -u proxmox-monitor -f
+sudo journalctl -u proxmox-monitor -f  # View live logs
 ```
 
 ## Configuration
+
+### Environment File (Credentials)
+
+Located at `/etc/proxmox-monitor/proxmox-monitor.env`
+
+Contains only the sensitive password - all other settings are in `config.yaml`:
+
+```bash
+# Edit to set your password
+sudo nano /etc/proxmox-monitor/proxmox-monitor.env
+
+# File contents:
+PROXMOX_PASSWORD=your_actual_password_here
+```
+
+**Important:** 
+- File is readable only by root (chmod 600)
+- Password is sourced by the systemd service
+- Keep this file secure - it contains credentials
 
 ### Configuration File Location
 

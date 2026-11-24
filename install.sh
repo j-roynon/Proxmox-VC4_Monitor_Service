@@ -40,24 +40,11 @@ if [ ! -f "$CONFIG_DIR/proxmox-monitor.env" ]; then
     echo -e "${YELLOW}Creating environment file for credentials...${NC}"
     cat > "$CONFIG_DIR/proxmox-monitor.env" << EOF
 # Proxmox Monitor Environment Variables
-# Edit this file to configure credentials and other settings
+# Only PROXMOX_PASSWORD is used here and sourced by the systemd service
+# All other settings are configured in config.yaml
 
-# Proxmox API credentials
-PROXMOX_HOST=10.10.10.3
-PROXMOX_USER=root@pam
+# Proxmox API password - SET THIS VALUE!
 PROXMOX_PASSWORD=your_password_here
-
-# CIP Device settings
-CIP_HOST=10.10.10.10
-CIP_IP_ID=0x13
-
-# Monitor settings
-MONITOR_INTERVAL=10
-FAILURE_THRESHOLD=3
-MIGRATION_TIMEOUT=60
-
-# Logging
-LOG_LEVEL=INFO
 EOF
     chmod 600 "$CONFIG_DIR/proxmox-monitor.env"
     echo -e "${YELLOW}✓ Created $CONFIG_DIR/proxmox-monitor.env${NC}"
