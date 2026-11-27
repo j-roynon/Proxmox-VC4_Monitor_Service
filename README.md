@@ -23,7 +23,7 @@ A robust monitoring and auto-failover system for Crestron VC4 VMs running on a P
 ✅ **Per-VM CIP Connections** - Each VM gets its own dedicated CIP connection for reliable health monitoring  
 ✅ **Container Health Checks** - Monitors Proxmox container status to ensure VMs are running  
 ✅ **CIP Pulse Monitoring** - Sends regular health pulses to Crestron devices and awaits responses  
-✅ **Automatic Failover** - Automatically migrates unhealthy VMs to other cluster nodes after 3 consecutive failures  
+✅ **Automatic Failover** - Shuts down unhealthy guests, migrates them offline, and starts them on another cluster node
 ✅ **10-Second Intervals** - Health checks run every 10 seconds for rapid failure detection  
 ✅ **Comprehensive Logging** - Full audit trail with per-VM identifiers for easy debugging  
 ✅ **Post-Install Configuration** - Modify settings anytime without reinstalling  
@@ -160,7 +160,7 @@ cip:
 monitor:
   interval: 10                  # Seconds between health checks
   failure_threshold: 3          # Failures before migration
-  migration_timeout: 60         # Seconds to wait for migration
+  migration_timeout: 60         # Per-operation wait and boot grace period before counting failures
   
   vms:
     "101":                       # Proxmox container ID
@@ -215,7 +215,7 @@ monitor:
 monitor:
   interval: 15              # Check every 15 seconds (slower)
   failure_threshold: 5      # 5 failures before migration (more tolerant)
-  migration_timeout: 120    # 2 minutes to complete migration
+  migration_timeout: 120    # 2 minutes per operation or VM boot grace period
 
 cip:
   pulse_timeout: 5          # 5 seconds timeout (flaky networks)
@@ -556,9 +556,14 @@ Each cycle, for every VM:
 4. Record result: HEALTHY or UNHEALTHY
 
 After 3 consecutive failures:
-  → Automatically migrate VM to next cluster node
-  → Reset failure counter after recovery
+  → Gracefully shut down the guest, migrate it offline, and start it on the target
+  → Wait for the boot grace period before counting failures again
 ```
+
+Offline migration transfers disk changes made since the last replication; it does not
+restore the previous replication snapshot. If a shutdown, migration, or start task times
+out or its outcome is unknown, monitoring for that guest pauses. Inspect the Proxmox
+task and guest location, resolve the outcome, then restart the monitor service.
 
 ## Deployment
 

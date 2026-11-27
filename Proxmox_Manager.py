@@ -44,6 +44,12 @@ class HealthCheckResult(Enum):
     UNKNOWN = "unknown"
 
 
+class MigrationResult(Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
+
 class VMHealthMonitor:
     """Tracks health status of a single VM."""
     
@@ -54,12 +60,17 @@ class VMHealthMonitor:
         self.last_check_time: Optional[datetime] = None
         self.last_healthy: Optional[datetime] = None
         self.migration_triggered = False
+        self.migration_uncertain = False
+        self.recovery_deadline: Optional[float] = None
+        self.recovery_attempted = False
     
     def record_success(self):
         """Record successful health check."""
         self.consecutive_failures = 0
         self.last_healthy = datetime.now()
         self.migration_triggered = False
+        self.recovery_deadline = None
+        self.recovery_attempted = False
     
     def record_failure(self):
         """Record failed health check."""
@@ -72,6 +83,30 @@ class VMHealthMonitor:
     def mark_migration_triggered(self):
         """Mark that migration has been initiated."""
         self.migration_triggered = True
+
+    def record_migration_failure(self):
+        """Reset the failure window so a failed migration can be retried."""
+        self.consecutive_failures = 0
+        self.migration_triggered = False
+        self.recovery_attempted = False
+
+    def start_recovery_countdown(self, seconds: int):
+        """Allow time for a stopped VM to boot before counting health failures."""
+        self.consecutive_failures = 0
+        self.migration_triggered = False
+        self.recovery_deadline = time.monotonic() + seconds
+        self.recovery_attempted = True
+
+    def recovery_countdown_remaining(self) -> Optional[float]:
+        """Return the remaining boot grace period, clearing it once it expires."""
+        if self.recovery_deadline is None:
+            return None
+
+        remaining = self.recovery_deadline - time.monotonic()
+        if remaining <= 0:
+            self.recovery_deadline = None
+            return None
+        return remaining
     
     def get_status(self) -> Dict:
         """Get current monitor status."""
@@ -175,22 +210,67 @@ class ProxmoxManager:
         except Exception as e:
             logger.error(f"Error checking VM {vm_id} status: {e}")
             return VMStatus.UNKNOWN
+
+    def start_vm(self, vm_id: str) -> bool:
+        """Start a stopped LXC container or QEMU VM."""
+        if not self.proxmox:
+            logger.error("Proxmox not connected; cannot start VM %s", vm_id)
+            return False
+
+        try:
+            nodes = self.proxmox.nodes.get()
+        except Exception as e:
+            logger.error(f"Could not list nodes to start VM {vm_id}: {e}")
+            return False
+
+        for node in nodes:
+            node_name = node['node']
+            for vm_type in ('lxc', 'qemu'):
+                try:
+                    guest = (
+                        self.proxmox.nodes(node_name).lxc(vm_id)
+                        if vm_type == 'lxc'
+                        else self.proxmox.nodes(node_name).qemu(vm_id)
+                    )
+                    status = guest.status.current.get().get('status', 'unknown').lower()
+                except Exception:
+                    continue
+
+                if status == 'running':
+                    logger.info(f"VM {vm_id} is already running on {node_name}")
+                    return True
+                if status != 'stopped':
+                    logger.error(f"Cannot start VM {vm_id} on {node_name}: unexpected status {status}")
+                    return False
+
+                try:
+                    task_id = guest.status.start.post()
+                except Exception as e:
+                    logger.error(f"Failed to start VM {vm_id} on {node_name}: {e}")
+                    return False
+
+                logger.info(f"Start command sent for VM {vm_id} on {node_name}, task ID: {task_id}")
+                return True
+
+        logger.error(f"Could not find VM {vm_id} on any node to start")
+        return False
     
-    def migrate_vm(self, vm_id: str, target_node: Optional[str] = None) -> bool:
+    def migrate_vm(self, vm_id: str, target_node: Optional[str] = None) -> MigrationResult:
         """
-        Migrate a VM to another node in the HA cluster (supports both LXC and QEMU).
+        Shut down, migrate offline, and start an LXC container or QEMU VM.
         
         Args:
             vm_id: Container/VM ID to migrate
             target_node: Target node name (if None, picks another available node)
             
         Returns:
-            True if migration started successfully
+            The outcome, including an unknown result if an operation may still be running.
         """
+        operation_in_progress = False
         try:
             if not self.proxmox:
                 logger.error("Proxmox not connected")
-                return False
+                return MigrationResult.FAILED
             
             # Find which node has the VM and determine its type (LXC or QEMU)
             source_node = None
@@ -201,7 +281,8 @@ class ProxmoxManager:
                 
                 # Try LXC first
                 try:
-                    self.proxmox.nodes(node_name).lxc(vm_id).status.current.get()
+                    guest = self.proxmox.nodes(node_name).lxc(vm_id)
+                    status = guest.status.current.get().get('status', 'unknown').lower()
                     source_node = node_name
                     vm_type = 'lxc'
                     break
@@ -210,7 +291,8 @@ class ProxmoxManager:
                 
                 # Try QEMU
                 try:
-                    self.proxmox.nodes(node_name).qemu(vm_id).status.current.get()
+                    guest = self.proxmox.nodes(node_name).qemu(vm_id)
+                    status = guest.status.current.get().get('status', 'unknown').lower()
                     source_node = node_name
                     vm_type = 'qemu'
                     break
@@ -219,7 +301,7 @@ class ProxmoxManager:
             
             if not source_node:
                 logger.error(f"Could not find VM {vm_id} on any node")
-                return False
+                return MigrationResult.FAILED
             
             # If no target node specified, pick the first available node that isn't the source
             if not target_node:
@@ -230,51 +312,69 @@ class ProxmoxManager:
             
             if not target_node:
                 logger.error(f"No available target nodes for migration (only have {source_node})")
-                return False
+                return MigrationResult.FAILED
+
+            if target_node == source_node:
+                logger.error(f"Target node for VM {vm_id} is its current node {source_node}")
+                return MigrationResult.FAILED
             
-            logger.info(f"Initiating migration of VM {vm_id} ({vm_type.upper()}) from {source_node} to {target_node}")
-            
-            # Prepare migration parameters (differ between LXC and QEMU)
-            if vm_type == 'lxc':
-                migrate_params = {
-                    'target': target_node,
-                    'online': 1  # LXC expects 0 or 1
-                }
-                task_id = self.proxmox.nodes(source_node).lxc(vm_id).migrate.post(**migrate_params)
-            else:  # qemu
-                # QEMU migration requires target and uses different parameter format
-                migrate_params = {
-                    'target': target_node,
-                    'online': 1  # QEMU also expects 0 or 1
-                }
-                task_id = self.proxmox.nodes(source_node).qemu(vm_id).migrate.post(**migrate_params)
-            
-            logger.info(f"Migration started for VM {vm_id}, task ID: {task_id}")
-            
-            # Wait for migration to complete
-            return self._wait_for_migration(source_node, vm_id, task_id)
+            logger.info(f"Initiating cold migration of VM {vm_id} ({vm_type.upper()}) from {source_node} to {target_node}")
+
+            if status != 'stopped':
+                if status not in ('running', 'paused'):
+                    logger.error(f"Cannot shut down VM {vm_id}: unexpected status {status}")
+                    return MigrationResult.FAILED
+                operation_in_progress = True
+                task_id = guest.status.shutdown.post()
+                result = self._wait_for_task(source_node, vm_id, task_id, "Shutdown")
+                if result != MigrationResult.SUCCESS:
+                    return result
+                operation_in_progress = False
+                if guest.status.current.get().get('status', 'unknown').lower() != 'stopped':
+                    logger.error(f"VM {vm_id} is not stopped after shutdown; migration cancelled")
+                    return MigrationResult.FAILED
+
+            operation_in_progress = True
+            task_id = guest.migrate.post(target=target_node)
+            result = self._wait_for_task(source_node, vm_id, task_id, "Migration")
+            if result != MigrationResult.SUCCESS:
+                return result
+            operation_in_progress = False
+
+            target = self.proxmox.nodes(target_node)
+            target_guest = target.lxc(vm_id) if vm_type == 'lxc' else target.qemu(vm_id)
+            operation_in_progress = True
+            task_id = target_guest.status.start.post()
+            return self._wait_for_task(target_node, vm_id, task_id, "Start")
             
         except Exception as e:
             logger.error(f"Error migrating VM {vm_id}: {e}")
-            return False
+            return MigrationResult.UNKNOWN if operation_in_progress else MigrationResult.FAILED
     
-    def _wait_for_migration(self, node: str, vm_id: str, task_id: str) -> bool:
-        """Wait for migration task to complete."""
-        start_time = time.time()
+    def _wait_for_task(self, node: str, vm_id: str, task_id: str, operation: str) -> MigrationResult:
+        """Wait for a Proxmox task to finish, without treating a timeout as failure."""
+        start_time = time.monotonic()
         
-        while time.time() - start_time < self.migration_timeout:
+        while time.monotonic() - start_time < self.migration_timeout:
             try:
                 task_status = self.proxmox.nodes(node).tasks(task_id).status.get()
                 if task_status.get('status') == 'stopped':
-                    logger.info(f"Migration completed for VM {vm_id}")
-                    return True
+                    exit_status = task_status.get('exitstatus')
+                    if exit_status == 'OK':
+                        logger.info(f"{operation} completed for VM {vm_id}, task ID: {task_id}")
+                        return MigrationResult.SUCCESS
+                    if not exit_status:
+                        logger.error(f"{operation} task {task_id} for VM {vm_id} has no exit status")
+                        return MigrationResult.UNKNOWN
+                    logger.error(f"{operation} failed for VM {vm_id}: {exit_status}")
+                    return MigrationResult.FAILED
             except Exception as e:
-                logger.debug(f"Error checking migration status: {e}")
+                logger.warning(f"Error checking {operation.lower()} task {task_id}: {e}")
             
             time.sleep(2)
         
-        logger.error(f"Migration timeout for VM {vm_id}")
-        return False
+        logger.error(f"{operation} timeout for VM {vm_id}, task ID: {task_id}; outcome unknown")
+        return MigrationResult.UNKNOWN
 
 
 # ============================================================================
@@ -460,7 +560,7 @@ class VMMonitorSystem:
         logger.info("Monitor system initialized successfully")
         return True
     
-    async def check_vm_health(self, vm_id: str) -> HealthCheckResult:
+    async def check_vm_health(self, vm_id: str, vm_status: Optional[VMStatus] = None) -> HealthCheckResult:
         """
         Perform comprehensive health check on a VM.
         
@@ -470,7 +570,7 @@ class VMMonitorSystem:
         logger.debug(f"Checking health of VM {vm_id}")
         
         # Check 1: Container status
-        status = self.proxmox.get_vm_status(vm_id)
+        status = vm_status if vm_status is not None else self.proxmox.get_vm_status(vm_id)
         if status != VMStatus.RUNNING:
             logger.warning(f"[VM {vm_id}] Container is not running (status: {status})")
             return HealthCheckResult.UNHEALTHY
@@ -502,9 +602,33 @@ class VMMonitorSystem:
                 for vm_id in self.vm_monitors.keys():
                     monitor = self.vm_monitors[vm_id]
                     monitor.last_check_time = datetime.now()
-                    
-                    # Perform health check
-                    health = await self.check_vm_health(vm_id)
+
+                    if monitor.migration_uncertain:
+                        logger.error(f"[VM {vm_id}] Migration outcome is unknown; manual investigation required")
+                        continue
+
+                    remaining = monitor.recovery_countdown_remaining()
+                    if remaining is not None:
+                        logger.info(f"[VM {vm_id}] Waiting for boot grace period ({remaining:.1f}s remaining)")
+                        continue
+
+                    status = self.proxmox.get_vm_status(vm_id)
+                    if status == VMStatus.STOPPED:
+                        if monitor.recovery_attempted:
+                            logger.warning(f"[VM {vm_id}] Container is still stopped after the boot grace period")
+                            health = HealthCheckResult.UNHEALTHY
+                        else:
+                            logger.warning(f"[VM {vm_id}] Container is stopped; attempting to start it")
+                            if self.proxmox.start_vm(vm_id):
+                                monitor.start_recovery_countdown(self.migration_timeout)
+                                logger.info(
+                                    f"[VM {vm_id}] Boot grace period started for {self.migration_timeout}s "
+                                    "before health failures are counted"
+                                )
+                                continue
+                            health = HealthCheckResult.UNHEALTHY
+                    else:
+                        health = await self.check_vm_health(vm_id, status)
                     
                     if health == HealthCheckResult.HEALTHY:
                         monitor.record_success()
@@ -545,13 +669,24 @@ class VMMonitorSystem:
     async def _migrate_with_logging(self, vm_id: str):
         """Perform migration with logging."""
         try:
-            success = self.proxmox.migrate_vm(vm_id)
-            if success:
-                logger.info(f"✓ VM {vm_id} migration completed successfully")
-            else:
+            result = self.proxmox.migrate_vm(vm_id)
+            if result == MigrationResult.SUCCESS:
+                self.vm_monitors[vm_id].start_recovery_countdown(self.migration_timeout)
+                logger.info(f"✓ VM {vm_id} cold migration completed; boot grace period started")
+            elif result == MigrationResult.FAILED:
                 logger.error(f"✗ VM {vm_id} migration failed")
+                self.vm_monitors[vm_id].record_migration_failure()
+                logger.warning(
+                    f"[VM {vm_id}] Failure counter reset; migration will be retried after "
+                    f"{self.failure_threshold} consecutive failures"
+                )
+            else:
+                self.vm_monitors[vm_id].migration_uncertain = True
+                logger.error(f"[VM {vm_id}] Migration outcome is unknown; manual investigation required")
         except Exception as e:
             logger.error(f"Error during VM {vm_id} migration: {e}", exc_info=True)
+            self.vm_monitors[vm_id].migration_uncertain = True
+            logger.error(f"[VM {vm_id}] Migration outcome is unknown; manual investigation required")
     
     def _log_status_summary(self):
         """Log summary of all VM statuses."""
@@ -559,7 +694,7 @@ class VMMonitorSystem:
         for vm_id, monitor in self.vm_monitors.items():
             status = monitor.get_status()
             summary_lines.append(
-                f"  VM {vm_id}: {status['consecutive_failures']}/3 failures, "
+                f"  VM {vm_id}: {status['consecutive_failures']}/{self.failure_threshold} failures, "
                 f"Last healthy: {status['last_healthy']}"
             )
         logger.info("\n".join(summary_lines))

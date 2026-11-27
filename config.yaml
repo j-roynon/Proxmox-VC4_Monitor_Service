@@ -14,16 +14,13 @@ cip:
 monitor:
   interval: 10  # seconds between health checks
   failure_threshold: 3  # consecutive failures before migration
-  migration_timeout: 60  # seconds to wait for migration to complete
+  migration_timeout: 60  # per-operation wait and boot grace period before counting failures
   
   # Each VM has its own CIP connection with unique host and IP_ID
   vms:
-    "100":  # Proxmox container ID
+    "101":  # Proxmox container ID
       cip_host: "10.10.10.10"  # Crestron VC4 device IP
-      cip_ip_id: 0x13          # Crestron IP ID for this VM's connection
-    "101":
-      cip_host: "10.10.10.11"  # Different Crestron device
-      cip_ip_id: 0x14          # Different IP ID
+      cip_ip_id: 0xFE          # Crestron IP ID for this VM's connection
 
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
