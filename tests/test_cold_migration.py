@@ -50,6 +50,10 @@ class ColdMigrationTests(unittest.TestCase):
         self.source.tasks.assert_any_call("migration-task")
         self.target.tasks.assert_called_with("start-task")
 
+    def test_guest_status_includes_its_node(self):
+        self.assertEqual(self.manager.get_vm_status_and_node("101"),
+                         (module.VMStatus.RUNNING, "source"))
+
     def test_qemu_uses_offline_migration(self):
         self.source.lxc.return_value.status.current.get.side_effect = RuntimeError("not a container")
         self.source_guest = self.source.qemu("101")
@@ -99,6 +103,7 @@ class ColdMigrationTests(unittest.TestCase):
         system.vm_monitors = {"101": module.VMHealthMonitor("101")}
         system.failure_threshold = 3
         system.migration_timeout = 60
+        system.cip_monitors = {"101": module.CIPMonitor("101", "cip-host", 0x13)}
         system.proxmox = types.SimpleNamespace(migrate_vm=lambda vm_id: module.MigrationResult.UNKNOWN)
         asyncio.run(system._migrate_with_logging("101"))
         self.assertTrue(system.vm_monitors["101"].migration_uncertain)
@@ -108,6 +113,7 @@ class ColdMigrationTests(unittest.TestCase):
         asyncio.run(system._migrate_with_logging("101"))
         self.assertGreater(system.vm_monitors["101"].recovery_countdown_remaining(), 0)
         self.assertEqual(system.vm_monitors["101"].consecutive_failures, 0)
+        self.assertTrue(system.cip_monitors["101"].reinitialize_required)
 
     def test_failure_rearms_stopped_guest_recovery(self):
         system = object.__new__(module.VMMonitorSystem)
@@ -138,9 +144,79 @@ class ColdMigrationTests(unittest.TestCase):
 
         with patch.object(module.asyncio, "sleep", side_effect=stop_after_cycle):
             asyncio.run(system.monitor_loop())
-        system.proxmox.get_vm_status.assert_not_called()
+        system.proxmox.get_vm_status_and_node.assert_not_called()
         system.proxmox.start_vm.assert_not_called()
         self.assertEqual(monitor.consecutive_failures, 0)
+
+
+class CIPReinitializationTests(unittest.TestCase):
+    def setUp(self):
+        self.system = object.__new__(module.VMMonitorSystem)
+        self.system.vm_monitors = {"101": module.VMHealthMonitor("101")}
+        self.cip = module.CIPMonitor("101", "cip-host", 0x13)
+        self.system.cip_monitors = {"101": self.cip}
+        self.system.proxmox = MagicMock()
+        self.clients = [MagicMock() for _ in range(6)]
+        self.client_factory = patch.object(module.cipclient, "CIPSocketClient", side_effect=self.clients)
+        self.sleep = patch.object(module.time, "sleep")
+        self.client_factory.start()
+        self.sleep.start()
+        self.addCleanup(self.client_factory.stop)
+        self.addCleanup(self.sleep.stop)
+        self.assertTrue(self.cip.connect())
+
+    def test_failed_pulse_reinitializes_before_next_pulse(self):
+        with patch.object(self.cip, "send_pulse", side_effect=[False, True]) as pulse:
+            self.assertEqual(asyncio.run(self.system.check_vm_health("101", module.VMStatus.RUNNING)),
+                             module.HealthCheckResult.UNHEALTHY)
+            self.assertEqual(asyncio.run(self.system.check_vm_health("101", module.VMStatus.RUNNING)),
+                             module.HealthCheckResult.HEALTHY)
+        self.assertEqual(pulse.call_count, 2)
+        self.clients[0].stop.assert_called_once()
+        self.clients[1].stop.assert_called_once()
+        self.clients[3].subscribe.assert_called_once_with("d", 1, self.cip._cip_callback)
+        self.assertFalse(self.cip.reinitialize_required)
+
+    def test_failed_reinitialization_is_retried_without_skipping_cip(self):
+        self.cip.reinitialize_required = True
+        self.clients[2].start.side_effect = RuntimeError("unavailable")
+        with patch.object(self.cip, "send_pulse", return_value=True) as pulse:
+            self.assertEqual(asyncio.run(self.system.check_vm_health("101", module.VMStatus.RUNNING)),
+                             module.HealthCheckResult.UNHEALTHY)
+            pulse.assert_not_called()
+            self.assertTrue(self.cip.reinitialize_required)
+            self.assertEqual(asyncio.run(self.system.check_vm_health("101", module.VMStatus.RUNNING)),
+                             module.HealthCheckResult.HEALTHY)
+            pulse.assert_called_once()
+
+    def test_external_host_change_reinitializes_before_pulse(self):
+        self.system.monitor_interval = 1
+        self.system.failure_threshold = 3
+        self.system.proxmox.get_vm_status_and_node.side_effect = [
+            (module.VMStatus.RUNNING, "source"),
+            (module.VMStatus.UNKNOWN, None),
+            (module.VMStatus.RUNNING, "target"),
+        ]
+        self.system._log_status_summary = lambda: None
+        cycles = []
+
+        async def stop_after_three_cycles(delay):
+            cycles.append(delay)
+            if len(cycles) == 3:
+                self.system.running = False
+
+        def verify_pulse():
+            if len(cycles) == 2:
+                self.clients[3].subscribe.assert_called_once_with("d", 1, self.cip._cip_callback)
+            return True
+
+        with patch.object(self.cip, "send_pulse", side_effect=verify_pulse) as pulse, \
+                patch.object(module.asyncio, "sleep", side_effect=stop_after_three_cycles):
+            asyncio.run(self.system.monitor_loop())
+        self.assertEqual(pulse.call_count, 2)
+        self.clients[0].stop.assert_called_once()
+        self.clients[1].stop.assert_called_once()
+        self.clients[3].subscribe.assert_called_once_with("d", 1, self.cip._cip_callback)
 
 
 if __name__ == "__main__":

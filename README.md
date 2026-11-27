@@ -571,6 +571,13 @@ attempt. A stopped guest is first started on its current node and given a boot
 grace period. This workflow requires a reachable API and a discoverable guest;
 it does not itself guarantee recovery from a physical host outage.
 
+After a successful monitor-initiated migration or a detected node change, the
+monitor reinitializes that guest's CIP clients before its next pulse. A failed
+pulse also causes reinitialization before the next pulse attempt. If
+reinitialization fails, the check is unhealthy and the monitor retries on a
+later check. The configured CIP address and IP ID are reused; update the
+configuration if the endpoint changes.
+
 ### Per-VM CIP Connections
 
 The monitor maintains independent CIP clients for each configured VM:

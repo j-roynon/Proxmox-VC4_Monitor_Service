@@ -63,6 +63,7 @@ class VMHealthMonitor:
         self.migration_uncertain = False
         self.recovery_deadline: Optional[float] = None
         self.recovery_attempted = False
+        self.last_node: Optional[str] = None
     
     def record_success(self):
         """Record successful health check."""
@@ -150,19 +151,24 @@ class ProxmoxManager:
             return False
     
     def get_vm_status(self, vm_id: str) -> VMStatus:
+        """Get the current status of an LXC container or QEMU VM."""
+        status, _ = self.get_vm_status_and_node(vm_id)
+        return status
+
+    def get_vm_status_and_node(self, vm_id: str) -> Tuple[VMStatus, Optional[str]]:
         """
-        Get the current status of a VM/container (supports both LXC and QEMU).
+        Get the current status and node of an LXC container or QEMU VM.
         
         Args:
             vm_id: Container/VM ID in Proxmox
             
         Returns:
-            VMStatus enum value
+            Status and node name, or UNKNOWN and None if the guest cannot be found.
         """
         try:
             if not self.proxmox:
                 logger.error("Proxmox not connected")
-                return VMStatus.UNKNOWN
+                return VMStatus.UNKNOWN, None
             
             # Try to get container/VM status from all nodes in cluster
             for node in self.proxmox.nodes.get():
@@ -175,13 +181,13 @@ class ProxmoxManager:
                     
                     if status_str == 'running':
                         logger.debug(f"VM {vm_id} on node {node_name}: RUNNING (LXC)")
-                        return VMStatus.RUNNING
+                        return VMStatus.RUNNING, node_name
                     elif status_str == 'stopped':
                         logger.debug(f"VM {vm_id} on node {node_name}: STOPPED (LXC)")
-                        return VMStatus.STOPPED
+                        return VMStatus.STOPPED, node_name
                     elif status_str == 'paused':
                         logger.debug(f"VM {vm_id} on node {node_name}: PAUSED (LXC)")
-                        return VMStatus.PAUSED
+                        return VMStatus.PAUSED, node_name
                 except Exception:
                     # Not an LXC container on this node, try QEMU VM
                     pass
@@ -193,23 +199,23 @@ class ProxmoxManager:
                     
                     if status_str == 'running':
                         logger.debug(f"VM {vm_id} on node {node_name}: RUNNING (QEMU)")
-                        return VMStatus.RUNNING
+                        return VMStatus.RUNNING, node_name
                     elif status_str == 'stopped':
                         logger.debug(f"VM {vm_id} on node {node_name}: STOPPED (QEMU)")
-                        return VMStatus.STOPPED
+                        return VMStatus.STOPPED, node_name
                     elif status_str == 'paused':
                         logger.debug(f"VM {vm_id} on node {node_name}: PAUSED (QEMU)")
-                        return VMStatus.PAUSED
+                        return VMStatus.PAUSED, node_name
                 except Exception:
                     # VM not on this node, try next
                     continue
             
             logger.warning(f"VM {vm_id} not found on any node")
-            return VMStatus.UNKNOWN
+            return VMStatus.UNKNOWN, None
             
         except Exception as e:
             logger.error(f"Error checking VM {vm_id} status: {e}")
-            return VMStatus.UNKNOWN
+            return VMStatus.UNKNOWN, None
 
     def start_vm(self, vm_id: str) -> bool:
         """Start a stopped LXC container or QEMU VM."""
@@ -393,6 +399,7 @@ class CIPMonitor:
         self.cip_client: Optional[cipclient.CIPSocketClient] = None
         self.cip_sub: Optional[cipclient.CIPSocketClient] = None
         self.connected = False
+        self.reinitialize_required = False
         self.pulse_received = False
         self.last_pulse_time: Optional[datetime] = None
     
@@ -418,8 +425,17 @@ class CIPMonitor:
             return True
         except Exception as e:
             logger.error(f"[VM {self.vm_id}] Failed to initialize CIP client: {e}")
-            self.connected = False
+            self.disconnect()
             return False
+
+    def reinitialize(self) -> bool:
+        """Replace both CIP clients and restore the pulse subscription."""
+        if not self.disconnect():
+            return False
+        if not self.connect():
+            return False
+        self.reinitialize_required = False
+        return True
     
     def _cip_callback(self, dataType: str, index: int, data: any) -> None:
         """
@@ -492,18 +508,21 @@ class CIPMonitor:
             logger.error(f"[VM {self.vm_id}] Error sending CIP pulse: {e}")
             return False
     
-    def disconnect(self):
+    def disconnect(self) -> bool:
         """Disconnect CIP client."""
-        try:
-            if self.cip_sub:
-                self.cip_sub.stop()
-                logger.info("CIP subscription client disconnected")
-            if self.cip_client:
-                self.cip_client.stop()
-                logger.info("CIP client disconnected")
-            self.connected = False
-        except Exception as e:
-            logger.error(f"Error disconnecting CIP client: {e}")
+        self.connected = False
+        self.pulse_received = False
+        stopped = True
+        for attribute in ("cip_sub", "cip_client"):
+            client = getattr(self, attribute)
+            if client:
+                try:
+                    client.stop()
+                    setattr(self, attribute, None)
+                except Exception as e:
+                    logger.error(f"[VM {self.vm_id}] Error disconnecting {attribute}: {e}")
+                    stopped = False
+        return stopped
 
 
 # ============================================================================
@@ -577,9 +596,15 @@ class VMMonitorSystem:
         
         # Check 2: CIP pulse (using VM-specific CIP monitor)
         cip_monitor = self.cip_monitors.get(vm_id)
+        if cip_monitor and cip_monitor.reinitialize_required:
+            logger.info(f"[VM {vm_id}] Reinitializing CIP connection before health check")
+            if not cip_monitor.reinitialize():
+                logger.warning(f"[VM {vm_id}] CIP reinitialization failed; will retry on next health check")
+                return HealthCheckResult.UNHEALTHY
         if cip_monitor and cip_monitor.connected:
             cip_alive = cip_monitor.send_pulse()
             if not cip_alive:
+                cip_monitor.reinitialize_required = True
                 logger.warning(f"VM {vm_id} failed CIP pulse check")
                 return HealthCheckResult.UNHEALTHY
             logger.debug(f"VM {vm_id} CIP pulse OK")
@@ -612,7 +637,12 @@ class VMMonitorSystem:
                         logger.info(f"[VM {vm_id}] Waiting for boot grace period ({remaining:.1f}s remaining)")
                         continue
 
-                    status = self.proxmox.get_vm_status(vm_id)
+                    status, node = self.proxmox.get_vm_status_and_node(vm_id)
+                    if node is not None:
+                        if monitor.last_node is not None and node != monitor.last_node:
+                            logger.info(f"[VM {vm_id}] Host changed from {monitor.last_node} to {node}")
+                            self.cip_monitors[vm_id].reinitialize_required = True
+                        monitor.last_node = node
                     if status == VMStatus.STOPPED:
                         if monitor.recovery_attempted:
                             logger.warning(f"[VM {vm_id}] Container is still stopped after the boot grace period")
@@ -671,6 +701,7 @@ class VMMonitorSystem:
         try:
             result = self.proxmox.migrate_vm(vm_id)
             if result == MigrationResult.SUCCESS:
+                self.cip_monitors[vm_id].reinitialize_required = True
                 self.vm_monitors[vm_id].start_recovery_countdown(self.migration_timeout)
                 logger.info(f"✓ VM {vm_id} cold migration completed; boot grace period started")
             elif result == MigrationResult.FAILED:
