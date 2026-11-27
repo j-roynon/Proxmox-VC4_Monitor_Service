@@ -520,14 +520,65 @@ ping 10.10.10.10                     # Test Crestron
 
 ## Architecture
 
+### Three-Host Topology
+
+The following is an illustrative three-host deployment, not an inventory of the
+configured environment. Host names, guest placement, and storage layout are not
+specified in this repository. Only VM 101 is configured in the example
+configuration; the other guests illustrate possible placements.
+
+```mermaid
+flowchart TB
+    Monitor["Monitor service<br/>VMMonitorSystem + per-VM health and CIP monitors"]
+    API["Configured Proxmox API endpoint"]
+    CIP["Configured CIP endpoint for VM 101<br/>pulse and mirrored response"]
+    Storage["Proxmox guest storage<br/>physical layout and type unspecified"]
+
+    subgraph Cluster["Proxmox cluster: three physical hosts"]
+        subgraph Host1["Physical host 1"]
+            VM1["VM 101<br/>example placement"]
+        end
+        subgraph Host2["Physical host 2"]
+            VM2["Guest B<br/>illustrative"]
+        end
+        subgraph Host3["Physical host 3"]
+            VM3["Guest C<br/>illustrative"]
+        end
+    end
+
+    Monitor -->|"Guest status, shutdown, migrate, start"| API
+    API -->|"Cluster API"| Cluster
+    Monitor <-->|"Per-VM CIP pulse and response"| CIP
+    Host1 ---|"Guest disk access"| Storage
+    Host2 ---|"Guest disk access"| Storage
+    Host3 ---|"Guest disk access"| Storage
+    Host1 <-.->|"Possible cold migration"| Host2
+    Host1 <-.->|"Possible cold migration"| Host3
+    Host2 <-.->|"Possible cold migration"| Host3
+```
+
+The monitor's deployment location is not specified; the diagram does not imply
+a separate physical host. The storage box represents guest storage logically,
+not necessarily a single shared device. Storage technology, replication, and
+availability must be configured in Proxmox; the monitor does not manage them.
+
+Dashed links show potential guest migration paths, not simultaneous migrations or
+an ordered failover chain. After the configured failure threshold, the monitor
+selects the first different node returned by the Proxmox API, shuts down the
+guest if needed, migrates it offline, and starts it on the target. It does not
+verify that the chosen target is healthy or try another target within that
+attempt. A stopped guest is first started on its current node and given a boot
+grace period. This workflow requires a reachable API and a discoverable guest;
+it does not itself guarantee recovery from a physical host outage.
+
 ### Per-VM CIP Connections
 
-Each monitored VM maintains its own independent CIP connection:
+The monitor maintains independent CIP clients for each configured VM:
 
 ```
-VM 100 → [CIPMonitor] → Crestron VC4 (10.10.10.10)
-VM 101 → [CIPMonitor] → Crestron VC4 (10.10.10.10)
-VM 102 → [CIPMonitor] → Crestron VC4 (10.10.10.11)
+Monitor → [CIPMonitor for VM 100] → Crestron VC4 (10.10.10.10)
+Monitor → [CIPMonitor for VM 101] → Crestron VC4 (10.10.10.10)
+Monitor → [CIPMonitor for VM 102] → Crestron VC4 (10.10.10.11)
 ```
 
 **Benefits:**
