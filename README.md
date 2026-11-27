@@ -532,7 +532,7 @@ flowchart TB
     Monitor["Monitor service<br/>VMMonitorSystem + per-VM health and CIP monitors"]
     API["Configured Proxmox API endpoint"]
     CIP["Configured CIP endpoint for VM 101<br/>pulse and mirrored response"]
-    Storage["Proxmox guest storage<br/>physical layout and type unspecified"]
+    Storage["Proxmox guest storage<br/>zfs or nfs"]
 
     subgraph Cluster["Proxmox cluster: three physical hosts"]
         subgraph Host1["Physical host 1"]
